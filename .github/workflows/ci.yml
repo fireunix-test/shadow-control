@@ -4,8 +4,9 @@
 # read-only deploy key. Logs may show the location of an error, but never
 # whole files: each step's output is capped, gofmt reports only file names and
 # nothing is uploaded as an artifact. The committed config/*.toml files are
-# never read here (they hold real endpoints and credentials): an empty
-# config/ci.toml is generated and RUNENV=ci selects it.
+# never read here (they hold real endpoints and credentials): config/ci.toml is
+# generated at run time and points at throwaway MySQL/ClickHouse/Redis service
+# containers with a random JWT secret, so every package's tests can run.
 name: CI
 
 on:
@@ -34,6 +35,32 @@ jobs:
     env:
       RUNENV: ci
       GOFLAGS: -mod=readonly
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: ci
+          MYSQL_DATABASE: shadow_ci
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -pci"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.8
+        env:
+          CLICKHOUSE_USER: ci
+          CLICKHOUSE_PASSWORD: ci
+          CLICKHOUSE_DB: shadow_ci
+        ports: ["9000:9000"]
+        options: >-
+          --health-cmd "clickhouse-client --user ci --password ci -q 'SELECT 1'"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 30
     defaults:
       run:
         working-directory: shadow-control
@@ -66,8 +93,37 @@ jobs:
 
       - name: Prepare CI-only inputs
         run: |
-          # Empty config: no real endpoints or credentials are loaded.
-          : > config/ci.toml
+          # Throwaway endpoints only; the JWT secret is random per run.
+          cat > config/ci.toml <<EOF
+          [DB]
+          Type = "mysql"
+          Username = "root"
+          Password = "ci"
+          Server = "127.0.0.1:3306"
+          Database = "shadow_ci"
+
+          [CK]
+          Type = "clickhouse"
+          Username = "ci"
+          Password = "ci"
+          Server = "127.0.0.1:9000"
+          Database = "shadow_ci"
+
+          [RedisConfig]
+          Host = "127.0.0.1"
+          Port = 6379
+          Database = 0
+          PoolSize = 10
+
+          [AuthConfig]
+          Secret = "$(openssl rand -hex 32)"
+          ExpirationHours = 1
+          RefreshExpirationHours = 24
+
+          [LogConfig.Console]
+          Enable = true
+          Level = "warn"
+          EOF
           # api/web embeds the built dashboard (gitignored); a placeholder lets
           # the package compile.
           mkdir -p api/web/dist/assets
@@ -76,7 +132,8 @@ jobs:
 
       - name: gofmt (file names only)
         run: |
-          files=$(gofmt -l $(git ls-files '*.go'))
+          # AI-tooling scripts under .claude/.codex are not part of the build.
+          files=$(gofmt -l $(git ls-files '*.go' ':!:.claude/**' ':!:.codex/**'))
           if [ -n "$files" ]; then
             echo "::error::gofmt would change these files:"
             echo "$files"
@@ -99,15 +156,4 @@ jobs:
         if: ${{ !cancelled() && inputs.run_tests }}
         run: |
           set -o pipefail
-          module=$(go list -m)
-          pkgs=()
-          for p in $(go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./...); do
-            # Packages whose init connects to MySQL/Redis cannot run here.
-            if go list -test -deps "$p" | grep -qx "$module/storage"; then
-              echo "skip (needs live databases): $p"
-            else
-              pkgs+=("$p")
-            fi
-          done
-          if [ ${#pkgs[@]} -eq 0 ]; then echo "no runnable test packages"; exit 0; fi
-          go test -count=1 "${pkgs[@]}" 2>&1 | cap
+          go test -count=1 ./... 2>&1 | cap
