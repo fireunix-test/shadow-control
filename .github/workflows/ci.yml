@@ -1,0 +1,113 @@
+# Vet/build/test the private fireunix-app/shadow-control source.
+#
+# This repository is PUBLIC: the source is checked out at run time with a
+# read-only deploy key. Logs may show the location of an error, but never
+# whole files: each step's output is capped, gofmt reports only file names and
+# nothing is uploaded as an artifact. The committed config/*.toml files are
+# never read here (they hold real endpoints and credentials): an empty
+# config/ci.toml is generated and RUNENV=ci selects it.
+name: CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch of fireunix-app/shadow-control"
+        required: true
+        default: main
+      run_tests:
+        description: "Run go test"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ inputs.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RUNENV: ci
+      GOFLAGS: -mod=readonly
+    defaults:
+      run:
+        working-directory: shadow-control
+        shell: bash
+    steps:
+      - name: Check out private source
+        uses: actions/checkout@v4
+        with:
+          repository: fireunix-app/shadow-control
+          ref: ${{ inputs.ref }}
+          path: shadow-control
+          ssh-key: ${{ secrets.CONTROL_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Set up Go (module + build cache)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: shadow-control/go.mod
+          cache-dependency-path: shadow-control/go.sum
+
+      - name: Install log limiter
+        working-directory: .
+        run: |
+          # Cap each step's output so a flood of errors cannot dump the source.
+          sudo tee /usr/local/bin/cap >/dev/null <<'SH'
+          #!/bin/sh
+          exec awk -v max=1500 'NR<=max { print; next } { cut++ } END { if (cut) printf "... output truncated: %d more lines not shown\n", cut }'
+          SH
+          sudo chmod +x /usr/local/bin/cap
+
+      - name: Prepare CI-only inputs
+        run: |
+          # Empty config: no real endpoints or credentials are loaded.
+          : > config/ci.toml
+          # api/web embeds the built dashboard (gitignored); a placeholder lets
+          # the package compile.
+          mkdir -p api/web/dist/assets
+          echo '<!doctype html><title>ci</title>' > api/web/dist/index.html
+          echo '/* ci */' > api/web/dist/assets/ci.js
+
+      - name: gofmt (file names only)
+        run: |
+          files=$(gofmt -l $(git ls-files '*.go'))
+          if [ -n "$files" ]; then
+            echo "::error::gofmt would change these files:"
+            echo "$files"
+            exit 1
+          fi
+
+      - name: go vet
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          go vet ./... 2>&1 | cap
+
+      - name: go build
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          go build ./... 2>&1 | cap
+
+      - name: go test
+        if: ${{ !cancelled() && inputs.run_tests }}
+        run: |
+          set -o pipefail
+          module=$(go list -m)
+          pkgs=()
+          for p in $(go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./...); do
+            # Packages whose init connects to MySQL/Redis cannot run here.
+            if go list -test -deps "$p" | grep -qx "$module/storage"; then
+              echo "skip (needs live databases): $p"
+            else
+              pkgs+=("$p")
+            fi
+          done
+          if [ ${#pkgs[@]} -eq 0 ]; then echo "no runnable test packages"; exit 0; fi
+          go test -count=1 "${pkgs[@]}" 2>&1 | cap
